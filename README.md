@@ -1,5 +1,7 @@
 # The Serverless Survivor
 
+**🔴 Live Demo: [survivor.lineargs.dev](https://survivor.lineargs.dev)**
+
 ![Gameplay Screenshot](docs/screenshot.png)
 
 **The Serverless Survivor** is a retro-futuristic survival quiz game built on Google Cloud. Players navigate the "Google Cloud Jungle," answering 10 survival scenarios per level to unlock new challenges and climb the survivor leaderboard.
