@@ -1,0 +1,68 @@
+@import "tailwindcss";
+@config "../../tailwind.config.mts";
+
+@theme {
+  --font-display: "Press Start 2P", system-ui, sans-serif;
+  --font-body: "Space Mono", monospace;
+}
+
+/*
+  The default border color has changed to `currentColor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+}
+
+:root {
+  --background: #051f10;
+  --foreground: #ededed;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-body);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-display);
+}
+
+@layer components {
+  .btn-retro {
+    @apply relative px-6 py-3 font-display uppercase tracking-widest text-xs sm:text-sm border-2 border-wood-border bg-survivor-gold text-wood-dark shadow-retro transition-all active:translate-y-1 active:shadow-retro-sm hover:brightness-110 active:brightness-100 cursor-pointer select-none;
+  }
+
+  .btn-retro-primary {
+    @apply bg-survivor-gold text-wood-dark;
+  }
+
+  .btn-retro-secondary {
+    @apply bg-wood text-survivor-paper border-wood-dark;
+  }
+
+  .card-retro {
+    @apply border-4 border-wood-border bg-[#5D4037] shadow-retro-lg p-6 relative text-survivor-paper;
+  }
+
+  .text-arcade {
+    @apply font-display text-white text-shadow-lg;
+  }
+
+  .text-arcade-warning {
+    @apply font-display text-survivor-warning text-shadow;
+  }
+}
