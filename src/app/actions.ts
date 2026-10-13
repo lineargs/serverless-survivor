@@ -85,7 +85,7 @@ export async function startLevel(token: string, level: number) {
 
     console.log(`[Server] startLevel check: locked=${level > currentUnlocked}, currentUnlocked=${currentUnlocked}`);
 
-    if (!Number.isInteger(level) || level < 1 || level > currentUnlocked) {
+    if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
         return { error: "Level Locked" };
     }
 
@@ -136,7 +136,7 @@ export async function submitAnswer(
     const userData = userSnap.data();
     const currentUnlocked = Number(userData?.unlockedLevel) || 1;
 
-    if (!Number.isInteger(level) || level < 1 || level > currentUnlocked) {
+    if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
       return { error: "Level Locked" };
     }
 
@@ -151,7 +151,7 @@ export async function submitAnswer(
     const question = questionSnap.data() as QuestionData;
     const questionLevel = Number(question.level);
 
-    if (!Number.isInteger(questionLevel) || questionLevel < 1 || questionLevel > currentUnlocked) {
+    if (!Number.isInteger(questionLevel) || questionLevel < 1 || questionLevel > 3 || questionLevel > currentUnlocked) {
       return { error: "Level Locked" };
     }
 
@@ -159,7 +159,7 @@ export async function submitAnswer(
       return { error: "Invalid level for question" };
     }
 
-    if (userData?.currentLevel !== undefined && userData?.currentLevel !== null && Number(userData.currentLevel) !== questionLevel) {
+    if (!Number.isInteger(userData?.currentLevel) || Number(userData.currentLevel) !== questionLevel) {
       return { error: "Invalid active level session" };
     }
 
@@ -249,12 +249,22 @@ export async function finalizeLevel(token: string, level: number) {
         const pending = Number(data?.pendingScore) || 0;
         const currentUnlocked = Number(data?.unlockedLevel) || 1;
 
-        if (!Number.isInteger(level) || level < 1 || level > currentUnlocked) {
+        if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
             return { error: "Level Locked" };
         }
 
-        if (data?.currentLevel !== undefined && data?.currentLevel !== null && Number(data.currentLevel) !== level) {
+        if (!Number.isInteger(data?.currentLevel) || Number(data.currentLevel) !== level) {
             return { error: "Invalid level session" };
+        }
+
+        const answeredQuestions: string[] = Array.isArray(data?.answeredQuestions)
+            ? data.answeredQuestions
+            : [];
+        const qSnap = await adminDb.collection("questions").where("level", "==", level).get();
+        const requiredQuestions = qSnap.empty ? 1 : Math.min(10, qSnap.docs.length);
+
+        if (answeredQuestions.length < requiredQuestions) {
+            return { error: "Level not completed" };
         }
         
         // Safely parse levelScores map to track PB per level
@@ -271,7 +281,7 @@ export async function finalizeLevel(token: string, level: number) {
 
         // 1. Level Progression Logic
         // If user completes the current max level, unlock the next one
-        const newUnlocked = level >= currentUnlocked ? level + 1 : currentUnlocked;
+        const newUnlocked = (pending > 0 && level >= currentUnlocked) ? Math.min(3, level + 1) : currentUnlocked;
         if (newUnlocked > currentUnlocked) {
             updates.unlockedLevel = newUnlocked;
         }
@@ -330,7 +340,7 @@ export async function getQuestions(token: string, level: number) {
     const userSnap = await userRef.get();
     const currentUnlocked = userSnap.exists ? (userSnap.data()?.unlockedLevel || 1) : 1;
     
-    if (level > currentUnlocked) {
+    if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
         return { error: "Level Locked" };
     }
 
