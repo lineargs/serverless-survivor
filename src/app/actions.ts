@@ -85,7 +85,7 @@ export async function startLevel(token: string, level: number) {
 
     console.log(`[Server] startLevel check: locked=${level > currentUnlocked}, currentUnlocked=${currentUnlocked}`);
 
-    if (level > currentUnlocked) {
+    if (!Number.isInteger(level) || level < 1 || level > currentUnlocked) {
         return { error: "Level Locked" };
     }
 
@@ -94,6 +94,8 @@ export async function startLevel(token: string, level: number) {
     // This ensures only the current run counts towards verification
     await userRef.set({
         pendingScore: 0,
+        currentLevel: level,
+        answeredQuestions: [],
         currentStartTimestamp: FieldValue.serverTimestamp()
     }, { merge: true });
 
@@ -125,6 +127,19 @@ export async function submitAnswer(
   if (!userId) return { error: "Unauthorized: Setup Required" };
 
   try {
+    const userRef = adminDb.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return { error: "User not found" };
+    }
+
+    const userData = userSnap.data();
+    const currentUnlocked = Number(userData?.unlockedLevel) || 1;
+
+    if (!Number.isInteger(level) || level < 1 || level > currentUnlocked) {
+      return { error: "Level Locked" };
+    }
+
     // 2. Fetch Question Data (Source of Truth)
     const questionRef = adminDb.collection("questions").doc(questionId);
     const questionSnap = await questionRef.get();
@@ -133,20 +148,50 @@ export async function submitAnswer(
       return { error: "Question not found" };
     }
 
-    const question = questionSnap.data() as Question;
-    
+    const question = questionSnap.data() as QuestionData;
+    const questionLevel = Number(question.level);
+
+    if (!Number.isInteger(questionLevel) || questionLevel < 1 || questionLevel > currentUnlocked) {
+      return { error: "Level Locked" };
+    }
+
+    if (questionLevel !== level) {
+      return { error: "Invalid level for question" };
+    }
+
+    if (userData?.currentLevel !== undefined && userData?.currentLevel !== null && Number(userData.currentLevel) !== questionLevel) {
+      return { error: "Invalid active level session" };
+    }
+
+    const answeredQuestions: string[] = Array.isArray(userData?.answeredQuestions)
+      ? userData.answeredQuestions
+      : [];
+
+    if (answeredQuestions.includes(questionId)) {
+      return { error: "Question already answered" };
+    }
+
+    if (answeredQuestions.length >= 10) {
+      return { error: "Maximum questions for level reached" };
+    }
+
+    if (typeof timeLeft !== "number" || !Number.isFinite(timeLeft) || timeLeft < 0 || timeLeft > 30) {
+      return { error: "Invalid time remaining" };
+    }
+
     // 3. Validation Logic
     const isCorrect = question.correctIndex === selectedIndex;
-    const weight = question.weight || 10;
+    const weight = Number(question.weight) || 10;
 
     let scoreDelta = 0;
-    const levelMultiplier = Number(level) || 1; 
+    const levelMultiplier = questionLevel;
 
     // 4. Scoring Algorithm
     if (isCorrect) {
+      const safeTimeLeft = Math.max(0, Math.min(30, Math.floor(timeLeft)));
       // Speed Bonus: 1 pt for every 2 seconds remaining
-      const speedBonus = timeLeft > 0 ? Math.floor(timeLeft / 2) : 0;
-      scoreDelta = (Number(weight) * levelMultiplier) + speedBonus;
+      const speedBonus = safeTimeLeft > 0 ? Math.floor(safeTimeLeft / 2) : 0;
+      scoreDelta = (weight * levelMultiplier) + speedBonus;
     }
 
     // Force integer for Firestore safety
@@ -154,14 +199,13 @@ export async function submitAnswer(
 
     console.log(`[Server] submitAnswer: u=${userId} delta=${scoreDelta}`);
 
-    const userRef = adminDb.collection("users").doc(userId);
-    
     // 5. Update State
     // Only increment PENDING score. This prevents users from spamming endpoints to boost total score.
     // Total score is only updated at the end of the level via finalizeLevel.
     // NOTE: We do NOT update displayName here to preserve the anonymized nickname.
     await userRef.set({
         pendingScore: FieldValue.increment(scoreDelta),
+        answeredQuestions: [...answeredQuestions, questionId],
         lastPlayed: FieldValue.serverTimestamp()
     }, { merge: true });
 
@@ -204,6 +248,14 @@ export async function finalizeLevel(token: string, level: number) {
         const data = docSnap.data();
         const pending = Number(data?.pendingScore) || 0;
         const currentUnlocked = Number(data?.unlockedLevel) || 1;
+
+        if (!Number.isInteger(level) || level < 1 || level > currentUnlocked) {
+            return { error: "Level Locked" };
+        }
+
+        if (data?.currentLevel !== undefined && data?.currentLevel !== null && Number(data.currentLevel) !== level) {
+            return { error: "Invalid level session" };
+        }
         
         // Safely parse levelScores map to track PB per level
         const levelScores = data?.levelScores || {};
@@ -213,6 +265,8 @@ export async function finalizeLevel(token: string, level: number) {
 
         let updates: any = {
             pendingScore: 0, // Cleanup: Always reset pending score after finalization
+            answeredQuestions: [],
+            currentLevel: null
         };
 
         // 1. Level Progression Logic
