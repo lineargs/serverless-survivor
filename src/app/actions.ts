@@ -63,6 +63,80 @@ async function verifyUserStrict(token: string) {
     return userId;
 }
 
+const userLocks = new Map<string, Promise<unknown>>();
+
+async function withUserLock<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = userLocks.get(userId) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    const chain = prev.then(() => next, () => next);
+    userLocks.set(userId, chain);
+    await prev.catch(() => {});
+    try {
+        return await fn();
+    } finally {
+        release();
+        if (userLocks.get(userId) === chain) {
+            userLocks.delete(userId);
+        }
+    }
+}
+
+async function runUserTransaction<T>(
+    userId: string,
+    fn: (tx: {
+        get: (ref: any) => Promise<any>;
+        set: (ref: any, data: any, opts?: any) => Promise<any> | any;
+    }) => Promise<T>
+): Promise<T> {
+    return withUserLock(userId, async () => {
+        if (typeof (adminDb as any).runTransaction === "function") {
+            return (adminDb as any).runTransaction(async (transaction: any) => {
+                return fn({
+                    get: (ref: any) => transaction.get(ref),
+                    set: (ref: any, data: any, opts?: any) => transaction.set(ref, data, opts),
+                });
+            });
+        }
+        const pendingWrites: Array<() => Promise<any>> = [];
+        const result = await fn({
+            get: (ref: any) => ref.get(),
+            set: (ref: any, data: any, opts?: any) => {
+                pendingWrites.push(() => ref.set(data, opts));
+            },
+        });
+        for (const write of pendingWrites) {
+            await write();
+        }
+        return result;
+    });
+}
+
+function getTimestampMillis(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+    if (value instanceof Date && Number.isFinite(value.getTime())) {
+        return value.getTime();
+    }
+    if (value && typeof value === "object") {
+        if ("toMillis" in value && typeof (value as { toMillis: unknown }).toMillis === "function") {
+            const ms = (value as { toMillis: () => number }).toMillis();
+            if (typeof ms === "number" && Number.isFinite(ms)) return ms;
+        }
+        if ("seconds" in value && typeof (value as { seconds: unknown }).seconds === "number") {
+            const sec = (value as { seconds: number }).seconds;
+            const nanos = "nanoseconds" in value && typeof (value as { nanoseconds: unknown }).nanoseconds === "number"
+                ? (value as { nanoseconds: number }).nanoseconds
+                : 0;
+            return sec * 1000 + Math.floor(nanos / 1_000_000);
+        }
+    }
+    return null;
+}
+
 /**
  * Verification helper to ensure user is authenticated and has a nickname set.
  * @param token - Firebase ID token
@@ -78,28 +152,30 @@ export async function startLevel(token: string, level: number) {
 
     // 2. Verify Level Access (Prevent skipping levels)
     const userRef = adminDb.collection("users").doc(userId);
-    const userSnap = await userRef.get();
-    
-    // Default unlocked level is 1
-    const currentUnlocked = userSnap.exists ? (userSnap.data()?.unlockedLevel || 1) : 1;
+    return runUserTransaction(userId, async (tx) => {
+        const userSnap = await tx.get(userRef);
 
-    console.log(`[Server] startLevel check: locked=${level > currentUnlocked}, currentUnlocked=${currentUnlocked}`);
+        // Default unlocked level is 1
+        const currentUnlocked = userSnap.exists ? (userSnap.data()?.unlockedLevel || 1) : 1;
 
-    if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
-        return { error: "Level Locked" };
-    }
+        console.log(`[Server] startLevel check: locked=${level > currentUnlocked}, currentUnlocked=${currentUnlocked}`);
 
-    // 3. Session Initialization
-    // Reset pending score to 0 to prevent carrying over points from previous attempts
-    // This ensures only the current run counts towards verification
-    await userRef.set({
-        pendingScore: 0,
-        currentLevel: level,
-        answeredQuestions: [],
-        currentStartTimestamp: FieldValue.serverTimestamp()
-    }, { merge: true });
+        if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
+            return { error: "Level Locked" };
+        }
 
-    return { success: true };
+        // 3. Session Initialization
+        // Reset pending score to 0 to prevent carrying over points from previous attempts
+        // This ensures only the current run counts towards verification
+        await tx.set(userRef, {
+            pendingScore: 0,
+            currentLevel: level,
+            answeredQuestions: [],
+            currentStartTimestamp: FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        return { success: true };
+    });
 }
 
 /**
@@ -126,96 +202,111 @@ export async function submitAnswer(
   const userId = await verifyUserStrict(token);
   if (!userId) return { error: "Unauthorized: Setup Required" };
 
+  if (typeof questionId !== "string" || !questionId.trim()) {
+    return { error: "Question not found" };
+  }
+
+  if (typeof timeLeft !== "number" || !Number.isFinite(timeLeft) || timeLeft < 0 || timeLeft > 30) {
+    return { error: "Invalid time remaining" };
+  }
+
   try {
     const userRef = adminDb.collection("users").doc(userId);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) {
-      return { error: "User not found" };
-    }
-
-    const userData = userSnap.data();
-    const currentUnlocked = Number(userData?.unlockedLevel) || 1;
-
-    if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
-      return { error: "Level Locked" };
-    }
-
-    // 2. Fetch Question Data (Source of Truth)
     const questionRef = adminDb.collection("questions").doc(questionId);
-    const questionSnap = await questionRef.get();
 
-    if (!questionSnap.exists) {
-      return { error: "Question not found" };
-    }
+    return await runUserTransaction(userId, async (tx) => {
+      const userSnap = await tx.get(userRef);
+      if (!userSnap.exists) {
+        return { error: "User not found" };
+      }
 
-    const question = questionSnap.data() as QuestionData;
-    const questionLevel = Number(question.level);
+      const userData = userSnap.data();
+      const currentUnlocked = Number(userData?.unlockedLevel) || 1;
 
-    if (!Number.isInteger(questionLevel) || questionLevel < 1 || questionLevel > 3 || questionLevel > currentUnlocked) {
-      return { error: "Level Locked" };
-    }
+      if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
+        return { error: "Level Locked" };
+      }
 
-    if (questionLevel !== level) {
-      return { error: "Invalid level for question" };
-    }
+      // 2. Fetch Question Data (Source of Truth)
+      const questionSnap = await tx.get(questionRef);
 
-    if (!Number.isInteger(userData?.currentLevel) || Number(userData.currentLevel) !== questionLevel) {
-      return { error: "Invalid active level session" };
-    }
+      if (!questionSnap.exists) {
+        return { error: "Question not found" };
+      }
 
-    const answeredQuestions: string[] = Array.isArray(userData?.answeredQuestions)
-      ? userData.answeredQuestions
-      : [];
+      const question = questionSnap.data() as QuestionData;
+      const questionLevel = Number(question.level);
 
-    if (answeredQuestions.includes(questionId)) {
-      return { error: "Question already answered" };
-    }
+      if (!Number.isInteger(questionLevel) || questionLevel < 1 || questionLevel > 3 || questionLevel > currentUnlocked) {
+        return { error: "Level Locked" };
+      }
 
-    if (answeredQuestions.length >= 10) {
-      return { error: "Maximum questions for level reached" };
-    }
+      if (questionLevel !== level) {
+        return { error: "Invalid level for question" };
+      }
 
-    if (typeof timeLeft !== "number" || !Number.isFinite(timeLeft) || timeLeft < 0 || timeLeft > 30) {
-      return { error: "Invalid time remaining" };
-    }
+      if (!Number.isInteger(userData?.currentLevel) || Number(userData.currentLevel) !== questionLevel) {
+        return { error: "Invalid active level session" };
+      }
 
-    // 3. Validation Logic
-    const isCorrect = question.correctIndex === selectedIndex;
-    const weight = Number(question.weight) || 10;
+      const answeredQuestions: string[] = Array.isArray(userData?.answeredQuestions)
+        ? userData.answeredQuestions
+        : [];
 
-    let scoreDelta = 0;
-    const levelMultiplier = questionLevel;
+      if (answeredQuestions.includes(questionId)) {
+        return { error: "Question already answered" };
+      }
 
-    // 4. Scoring Algorithm
-    if (isCorrect) {
-      const safeTimeLeft = Math.max(0, Math.min(30, Math.floor(timeLeft)));
-      // Speed Bonus: 1 pt for every 2 seconds remaining
-      const speedBonus = safeTimeLeft > 0 ? Math.floor(safeTimeLeft / 2) : 0;
-      scoreDelta = (weight * levelMultiplier) + speedBonus;
-    }
+      if (answeredQuestions.length >= 10) {
+        return { error: "Maximum questions for level reached" };
+      }
 
-    // Force integer for Firestore safety
-    scoreDelta = Math.round(Number(scoreDelta));
+      const startMs = getTimestampMillis(userData?.currentStartTimestamp);
+      const elapsedSeconds = startMs !== null
+        ? Math.max(0, Math.floor((Date.now() - startMs) / 1000))
+        : 30;
+      const serverTimeLeft = Math.max(0, 30 - elapsedSeconds);
 
-    console.log(`[Server] submitAnswer: u=${userId} delta=${scoreDelta}`);
+      // 3. Validation Logic
+      const isCorrect = question.correctIndex === selectedIndex;
+      const weight = Number(question.weight) || 10;
 
-    // 5. Update State
-    // Only increment PENDING score. This prevents users from spamming endpoints to boost total score.
-    // Total score is only updated at the end of the level via finalizeLevel.
-    // NOTE: We do NOT update displayName here to preserve the anonymized nickname.
-    await userRef.set({
-        pendingScore: FieldValue.increment(scoreDelta),
-        answeredQuestions: [...answeredQuestions, questionId],
-        lastPlayed: FieldValue.serverTimestamp()
-    }, { merge: true });
+      let scoreDelta = 0;
+      const levelMultiplier = questionLevel;
 
-    return {
-      correct: isCorrect,
-      correctIndex: question.correctIndex, // Reveal correct answer
-      explanation: question.explanation,   // Provide educational context
-      scoreDelta,
-      newTotalScore: 0 // Placeholder, not used in UI currently
-    };
+      // 4. Scoring Algorithm
+      if (isCorrect) {
+        const safeTimeLeft = Math.max(0, Math.min(30, Math.floor(timeLeft), serverTimeLeft));
+        // Speed Bonus: 1 pt for every 2 seconds remaining
+        const speedBonus = safeTimeLeft > 0 ? Math.floor(safeTimeLeft / 2) : 0;
+        scoreDelta = (weight * levelMultiplier) + speedBonus;
+      }
+
+      // Force integer for Firestore safety
+      scoreDelta = Math.round(Number(scoreDelta));
+
+      console.log(`[Server] submitAnswer: u=${userId} delta=${scoreDelta}`);
+
+      // 5. Update State Atomically
+      // Only increment PENDING score. This prevents users from spamming endpoints to boost total score.
+      // Total score is only updated at the end of the level via finalizeLevel.
+      // NOTE: We do NOT update displayName here to preserve the anonymized nickname.
+      const currentPending = Number(userData?.pendingScore) || 0;
+      await tx.set(userRef, {
+          pendingScore: currentPending + scoreDelta,
+          answeredQuestions: [...answeredQuestions, questionId],
+          currentStartTimestamp: FieldValue.serverTimestamp(),
+          lastPlayed: FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return {
+        correct: isCorrect,
+        correctIndex: question.correctIndex, // Reveal correct answer
+        explanation: question.explanation,   // Provide educational context
+        scoreDelta,
+        newTotalScore: 0 // Placeholder, not used in UI currently
+      };
+    });
 
   } catch (error) {
     console.error("submitAnswer Error:", error);
@@ -239,78 +330,82 @@ export async function finalizeLevel(token: string, level: number) {
     const userRef = adminDb.collection("users").doc(userId);
     
     try {
-        const docSnap = await userRef.get();
-        if (!docSnap.exists) {
-            console.error("[Server] finalizeLevel: User doc not found");
-            return { error: "User not found" };
-        }
-
-        const data = docSnap.data();
-        const pending = Number(data?.pendingScore) || 0;
-        const currentUnlocked = Number(data?.unlockedLevel) || 1;
-
-        if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
-            return { error: "Level Locked" };
-        }
-
-        if (!Number.isInteger(data?.currentLevel) || Number(data.currentLevel) !== level) {
-            return { error: "Invalid level session" };
-        }
-
-        const answeredQuestions: string[] = Array.isArray(data?.answeredQuestions)
-            ? data.answeredQuestions
-            : [];
         const qSnap = await adminDb.collection("questions").where("level", "==", level).get();
         const requiredQuestions = qSnap.empty ? 1 : Math.min(10, qSnap.docs.length);
 
-        if (answeredQuestions.length < requiredQuestions) {
-            return { error: "Level not completed" };
-        }
-        
-        // Safely parse levelScores map to track PB per level
-        const levelScores = data?.levelScores || {};
-        const previousBest = Number(levelScores[level.toString()]) || 0;
+        return await runUserTransaction(userId, async (tx) => {
+            const docSnap = await tx.get(userRef);
+            if (!docSnap.exists) {
+                console.error("[Server] finalizeLevel: User doc not found");
+                return { error: "User not found" };
+            }
 
-        console.log(`[Server] Finalize: Pending=${pending}, PrevBest=${previousBest} for Level ${level}`);
+            const data = docSnap.data();
+            const pending = Number(data?.pendingScore) || 0;
+            const currentUnlocked = Number(data?.unlockedLevel) || 1;
 
-        let updates: any = {
-            pendingScore: 0, // Cleanup: Always reset pending score after finalization
-            answeredQuestions: [],
-            currentLevel: null
-        };
+            if (!Number.isInteger(level) || level < 1 || level > 3 || level > currentUnlocked) {
+                return { error: "Level Locked" };
+            }
 
-        // 1. Level Progression Logic
-        // If user completes the current max level, unlock the next one
-        const newUnlocked = (pending > 0 && level >= currentUnlocked) ? Math.min(3, level + 1) : currentUnlocked;
-        if (newUnlocked > currentUnlocked) {
-            updates.unlockedLevel = newUnlocked;
-        }
+            if (!Number.isInteger(data?.currentLevel) || Number(data.currentLevel) !== level) {
+                return { error: "Invalid level session" };
+            }
 
-        // 2. High Score Logic
-        // Only add to Total Score if the new pending score is greater than the previous best for this level.
-        // This prevents farming total score by replaying the same level.
-        if (pending > previousBest) {
-            const scoreDiff = pending - previousBest;
-            updates.totalScore = FieldValue.increment(scoreDiff);
+            const answeredQuestions: string[] = Array.isArray(data?.answeredQuestions)
+                ? data.answeredQuestions
+                : [];
+
+            if (answeredQuestions.length < requiredQuestions) {
+                return { error: "Level not completed" };
+            }
             
-            // Update the map in memory and write the whole field to ensure it exists
-            levelScores[level.toString()] = pending;
-            updates.levelScores = levelScores;
-            
-            console.log(`[Server] New High Score! Adding ${scoreDiff} to total. Updated LevelMap:`, levelScores);
-        } else {
-            console.log(`[Server] No high score beat. Keeping previous best.`);
-        }
+            // Safely parse levelScores map to track PB per level
+            const levelScores = data?.levelScores || {};
+            const previousBest = Number(levelScores[level.toString()]) || 0;
 
-        // Atomic update to Firestore
-        await userRef.set(updates, { merge: true });
-        
-        return { 
-            success: true, 
-            highScoreBeaten: pending > previousBest, 
-            previousBest, 
-            newScore: pending 
-        };
+            console.log(`[Server] Finalize: Pending=${pending}, PrevBest=${previousBest} for Level ${level}`);
+
+            let updates: any = {
+                pendingScore: 0, // Cleanup: Always reset pending score after finalization
+                answeredQuestions: [],
+                currentLevel: null,
+                currentStartTimestamp: null
+            };
+
+            // 1. Level Progression Logic
+            // If user completes the current max level, unlock the next one
+            const newUnlocked = (pending > 0 && level >= currentUnlocked) ? Math.min(3, level + 1) : currentUnlocked;
+            if (newUnlocked > currentUnlocked) {
+                updates.unlockedLevel = newUnlocked;
+            }
+
+            // 2. High Score Logic
+            // Only add to Total Score if the new pending score is greater than the previous best for this level.
+            // This prevents farming total score by replaying the same level.
+            if (pending > previousBest) {
+                const scoreDiff = pending - previousBest;
+                updates.totalScore = FieldValue.increment(scoreDiff);
+                
+                // Update the map in memory and write the whole field to ensure it exists
+                levelScores[level.toString()] = pending;
+                updates.levelScores = levelScores;
+                
+                console.log(`[Server] New High Score! Adding ${scoreDiff} to total. Updated LevelMap:`, levelScores);
+            } else {
+                console.log(`[Server] No high score beat. Keeping previous best.`);
+            }
+
+            // Atomic update to Firestore
+            await tx.set(userRef, updates, { merge: true });
+            
+            return { 
+                success: true, 
+                highScoreBeaten: pending > previousBest, 
+                previousBest, 
+                newScore: pending 
+            };
+        });
 
     } catch (e) {
         console.error("Finalize Level Error", e);
