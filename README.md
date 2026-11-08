@@ -180,3 +180,9 @@ If you are interested in building similar backend scripts to manage your own con
 - **Firebase Admin SDK**: [Server-side Node.js integration](https://firebase.google.com/docs/admin/setup)
 - **Vertex AI Node.js SDK**: [Integrate Gemini into your code](https://docs.cloud.google.com/nodejs/docs/reference/aiplatform/latest)
 - **Cloud Scheduler**: [Automate content updates](https://cloud.google.com/scheduler)
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
